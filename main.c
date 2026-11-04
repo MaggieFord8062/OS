@@ -167,7 +167,7 @@ int main(int argc, char *argv[]) {
         (total_cpu_time / (logical_cores * elapsed)) * 100.0;
 
     printf("\n--- Performance Measurements ---\n");
-    printf("Execution time: %.6f seconds\n", elapsed);
+    printf("Elapsed time: %.6f seconds\n", elapsed);
     printf("Total CPU time: %.6f seconds\n", total_cpu_time);
     printf("Logical CPU cores: %ld\n", logical_cores);
     printf("Average CPU utilization: %.2f%%\n",
