@@ -1,4 +1,3 @@
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -8,14 +7,46 @@
 #include <sys/resource.h>
 #include <time.h>
 #include <errno.h>
+#include <limits.h>
 
+#define SHM_NAME "/producer_consumer_shm"
+
+// Shared region: only state that several processes must see lives here.
+// buffer_size and upper_limit are NOT shared. Each child receives them
+// as command-line arguments and keeps them in local variables.
 typedef struct {
-    int buffer_size;
-    int count;
-    int next_value;
-    int upper_limit;
-    int buffer[1];
+    int count;       // items believed to be in the buffer
+    int in;          // next slot to write (shared by producers)
+    int out;         // next slot to read (shared by consumers)
+    int next_value;  // next value to produce (shared by producers)
+    int buffer[1];   // bounded buffer, really buffer_size ints
 } SharedData;
+
+void print_usage(const char *program) {
+    fprintf(stderr,
+            "Usage: %s <buffer_size> <num_producers> "
+            "<num_consumers> <upper_limit>\n"
+            "  buffer_size, num_producers, num_consumers: positive integers\n"
+            "  upper_limit: integer >= 0\n",
+            program);
+}
+
+// Parse a whole string as an int. Returns 1 on success, 0 on failure.
+int parse_int(const char *text, int *result) {
+    char *end;
+    errno = 0;
+    long value = strtol(text, &end, 10);
+
+    if (errno != 0 || end == text || *end != '\0') {
+        return 0;
+    }
+    if (value < INT_MIN || value > INT_MAX) {
+        return 0;
+    }
+
+    *result = (int)value;
+    return 1;
+}
 
 // Convert a timeval to seconds.
 double timeval_to_seconds(struct timeval t) {
@@ -30,29 +61,38 @@ double cpu_time(struct rusage usage) {
 
 int main(int argc, char *argv[]) {
     if (argc != 5) {
-        fprintf(stderr,
-                "Usage: %s <buffer_size> <num_producers> "
-                "<num_consumers> <upper_limit>\n",
-                argv[0]);
+        print_usage(argv[0]);
         return 1;
     }
 
-    int buffer_size = atoi(argv[1]);
-    int num_producers = atoi(argv[2]);
-    int num_consumers = atoi(argv[3]);
-    int upper_limit = atoi(argv[4]);
+    int buffer_size;
+    int num_producers;
+    int num_consumers;
+    int upper_limit;
+
+    if (!parse_int(argv[1], &buffer_size) ||
+        !parse_int(argv[2], &num_producers) ||
+        !parse_int(argv[3], &num_consumers) ||
+        !parse_int(argv[4], &upper_limit)) {
+        fprintf(stderr, "Error: all arguments must be integers.\n");
+        print_usage(argv[0]);
+        return 1;
+    }
 
     if (buffer_size <= 0 || num_producers <= 0 ||
         num_consumers <= 0 || upper_limit < 0) {
-        fprintf(stderr, "Invalid arguments.\n");
+        fprintf(stderr, "Error: invalid argument value.\n");
+        print_usage(argv[0]);
         return 1;
     }
 
     size_t memory_size =
         sizeof(SharedData) + (buffer_size - 1) * sizeof(int);
 
-    int fd = shm_open("/producer_consumer_shm",
-                      O_CREAT | O_RDWR, 0666);
+    // Remove any leftover segment from a run that was interrupted.
+    shm_unlink(SHM_NAME);
+
+    int fd = shm_open(SHM_NAME, O_CREAT | O_RDWR, 0666);
 
     if (fd == -1) {
         perror("shm_open");
@@ -62,7 +102,7 @@ int main(int argc, char *argv[]) {
     if (ftruncate(fd, memory_size) == -1) {
         perror("ftruncate");
         close(fd);
-        shm_unlink("/producer_consumer_shm");
+        shm_unlink(SHM_NAME);
         return 1;
     }
 
@@ -73,20 +113,28 @@ int main(int argc, char *argv[]) {
     if (shared == MAP_FAILED) {
         perror("mmap");
         close(fd);
-        shm_unlink("/producer_consumer_shm");
+        shm_unlink(SHM_NAME);
         return 1;
     }
 
-    shared->buffer_size = buffer_size;
     shared->count = 0;
+    shared->in = 0;
+    shared->out = 0;
     shared->next_value = 0;
-    shared->upper_limit = upper_limit;
+
+    // Process-local configuration passed to every child through exec.
+    char size_arg[16];
+    char limit_arg[16];
+    snprintf(size_arg, sizeof(size_arg), "%d", buffer_size);
+    snprintf(limit_arg, sizeof(limit_arg), "%d", upper_limit);
 
     int total_children = num_producers + num_consumers;
     double children_cpu_time = 0.0;
 
-    struct timespec start, end;
-    struct rusage main_start, main_end;
+    struct timespec start;
+    struct timespec end;
+    struct rusage main_start;
+    struct rusage main_end;
 
     // Begin measurement immediately before launching processes.
     clock_gettime(CLOCK_MONOTONIC, &start);
@@ -99,7 +147,8 @@ int main(int argc, char *argv[]) {
         if (pid == 0) {
             char id[16];
             snprintf(id, sizeof(id), "%d", i + 1);
-            execl("./producer", "producer", id, (char *)NULL);
+            execl("./producer", "producer", id, size_arg, limit_arg,
+                  (char *)NULL);
             perror("execl producer");
             exit(1);
         } else if (pid < 0) {
@@ -115,7 +164,8 @@ int main(int argc, char *argv[]) {
         if (pid == 0) {
             char id[16];
             snprintf(id, sizeof(id), "%d", i + 1);
-            execl("./consumer", "consumer", id, (char *)NULL);
+            execl("./consumer", "consumer", id, size_arg, limit_arg,
+                  (char *)NULL);
             perror("execl consumer");
             exit(1);
         } else if (pid < 0) {
@@ -124,7 +174,7 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    // Collect each child's CPU usage exactly once.
+    // Reap every child and collect its CPU usage exactly once.
     int completed = 0;
 
     while (completed < total_children) {
@@ -166,17 +216,17 @@ int main(int argc, char *argv[]) {
     double cpu_utilization =
         (total_cpu_time / (logical_cores * elapsed)) * 100.0;
 
-    printf("\n--- Performance Measurements ---\n");
-    printf("Elapsed time: %.6f seconds\n", elapsed);
-    printf("Total CPU time: %.6f seconds\n", total_cpu_time);
-    printf("Logical CPU cores: %ld\n", logical_cores);
-    printf("Average CPU utilization: %.2f%%\n",
-           cpu_utilization);
+    // Measurements go to stderr so stdout can be redirected to a file.
+    fprintf(stderr, "\n--- Performance Measurements ---\n");
+    fprintf(stderr, "Elapsed time: %.6f seconds\n", elapsed);
+    fprintf(stderr, "Total CPU time: %.6f seconds\n", total_cpu_time);
+    fprintf(stderr, "Logical CPU cores: %ld\n", logical_cores);
+    fprintf(stderr, "Average CPU utilization: %.2f%%\n",
+            cpu_utilization);
 
     munmap(shared, memory_size);
     close(fd);
-    shm_unlink("/producer_consumer_shm");
+    shm_unlink(SHM_NAME);
 
     return 0;
 }
-
